@@ -2,7 +2,7 @@
 
 """
 Usage:
-  rqa.py import [--api_key=<api_key>] <input_pdf> <vector_db>
+  rqa.py import [--api_key=<api_key>] [-b] <input_pdf> <vector_db>
   rqa.py search [-n <top_k>] <vector_db> <question>
   rqa.py ask [--api_key=<api_key>] <vector_db> <question>
   rqa.py quiz [--api_key=<api_key>] <vector_db> <questions_json> <output_json>
@@ -15,11 +15,12 @@ Commands:
 
 
 Options:
+  -b                    Do not use semantic chunking on import [Default: False]
   --api_key=<api_key>   OpenAI API key [default: os.getenv("OPENAI_API_KEY")]
   -n <top_k>            Number of top chunks to retrieve [default: 10]
 
 Arguments:
-  <input_pdf>       Path to the input PDF document.
+  <input_pdf>       Path to the input PDF document or a path to a folder of PDF documents.
   <question>        The question to ask.
   <vector_db>       Path to the ChromaDB vector database folder. Created with `import`.
   <questions_json>  JSON file containing questions for the quiz.
@@ -47,17 +48,31 @@ LOCAL_EMBEDDING_MODEL = "all-mpnet-base-v2"  # Local Embedding Model (~ 400 MB)
 OPENAI_MODEL = "gpt-4o-mini"                 # OpenAI Model
 MAX_TOKENS = 1024                            # Maximum tokens allowed for embeddings
 
+
+##
+## Need to process tables and images
+## Need to process sequences
+##
+## table_args={
+#                 "parsing_algorithm": "table-transformers",
+#                 "min_table_confidence": 0.8,
+#             }            
+
+
+
 def extract_pdf_text(pdf_path, api_key=None):
     """Extract text from a PDF while preserving document structure."""
-    semantic_pipeline = openparse.processing.SemanticIngestionPipeline(
-        openai_api_key=api_key,
-        model="text-embedding-3-large",
-        min_tokens=64,
-        max_tokens=1024
-    )
-    parser = openparse.DocumentParser(
-        processing_pipeline=semantic_pipeline
-    )
+    if api_key:
+        pipeline = openparse.processing.SemanticIngestionPipeline(
+            openai_api_key=api_key,
+            model="text-embedding-3-large",
+            min_tokens=64,
+            max_tokens=1024
+        )
+    else:
+        pipeline = openparse.processing.BasicIngestionPipeline(
+        )
+    parser = openparse.DocumentParser(processing_pipeline=pipeline)
     return parser.parse(pdf_path)
 
 def create_chunks(parsed_doc):
@@ -65,8 +80,8 @@ def create_chunks(parsed_doc):
     Create text chunks from the parsed document
     """
     chunks = []
-    for node in parsed_doc.nodes:
-        chunks.append(f"<<PAGE: {node.start_page}>>\n{node.text}")
+    for i, node in enumerate(parsed_doc.nodes):
+        chunks.append(f"<<FILENAME: {parsed_doc.filename}, PAGE: {node.start_page}, CHUNK: {i}>>\n{node.text}")
     return chunks
 
 def initialize_chroma(vector_db_path):
@@ -113,10 +128,12 @@ def find_relevant_chunks(question, vector_db_path, top_k=20):
 def make_prompt(question, relevant_chunks):
     """Creates a prompt for OpenAI based on the question and relevant document chunks."""
     return f"""
-        You are an AI assistant answering a question based on a document. 
-        The relevant document sections are provided below where each document
-        section is preceeded by `<<PAGE: X>>` where X is the page number in
-        the document where the section is found.
+
+        You are an AI assistant answering a question based on a set of
+        documents.  The relevant document sections are provided below
+        where each document section is preceeded by `<<FILENAME: F,
+        PAGE: X, CHUNK: C>>` where F is the filename X is the page
+        number and C is the chunk ID for the subsequent text.
         
         Provide your answer in the following format:
             
@@ -127,10 +144,13 @@ def make_prompt(question, relevant_chunks):
 
         Where: 
 
-            <answer> - should be a concise answer to the question based only on the document.
+            <answer> - should be a concise answer to the question
+                       based only on the document.
+    
 
-            <evidence> - should be a list of relevant document text, quoted verbatim, along with
-                        its page of origin supporting the answer.
+            <evidence> - should be a list of relevant document text,
+                        quoted verbatim, along with its FILENAME, PAGE
+                        and CHUNK of origin supporting the answer.
 
                         
         **Relevant Document Sections:**
@@ -255,17 +275,31 @@ def main():
         for chunk in relevant_chunks:
             print(f"chunk: {chunk}")
     else:
-        api_key = args["--api_key"] if args["--api_key"] else os.environ["OPENAI_API_KEY"]
+        api_key = args["--api_key"] if args["--api_key"] else os.getenv("OPENAI_API_KEY")
         if not api_key:
             print("Error: --api_key is required for 'import, ask and quiz' commands.")
             return
     
         if args["import"]:
             input_pdf = args["<input_pdf>"]
-            parsed_doc = extract_pdf_text(input_pdf, api_key)
-            chunks = create_chunks(parsed_doc)
-            store_chunks_in_chroma(chunks, vector_db_path)
-            print(f"Stored {len(chunks)} chunks in ChromaDB at {vector_db_path}")
+            basic_chunking = args["-b"]
+            if basic_chunking:
+                api_key = None
+            
+            if os.path.isdir(input_pdf):
+                pdfs = set(os.path.join(input_pdf, f) for f in os.listdir(input_pdf) if f.endswith(".pdf"))
+            else:
+                pdfs = [input_pdf]
+            
+            print(f"Processing {len(pdfs)} pdf files.")
+            
+            for pdf in pdfs:
+                print(f"Processing {pdf} file.")
+                parsed_doc = extract_pdf_text(pdf, api_key)
+                chunks = create_chunks(parsed_doc)
+                store_chunks_in_chroma(chunks, vector_db_path)
+                print(f"Stored {len(chunks)} chunks in ChromaDB at {vector_db_path}")
+                
 
         elif args["ask"]:
             question = args["<question>"]
